@@ -1,5 +1,12 @@
 # Cuda-speed-developing
-I'm a young middle school student who enthusiastic about programing and IC design.Recently,I got into cuda and pytorch coding in school's AI club.Many people use packaged data like"import torch",Well,I more interested in cuda.This project work on lenet high speed training and performance optimize.However,I'm beginner,hope everyone can help me!
-well Hey bro! Nice to meet you!
-well,this file's main body is still almost empty...I am writing.
-Don't forget,I am from China!
+I'm a middle school student passionate about programming and IC design. Recently, I've been diving into CUDA and PyTorch coding in my school's AI club.
+
+While many people use packaged tools like import torch, I'm more interested in the low-level implementation. This project focuses on high-speed training and performance optimization of LeNet using CUDA.
+
+I'm still a beginner, so any help or advice is greatly appreciated!
+
+Hey bro! Nice to meet you! 😄
+
+PS: I'm from China! 🇨🇳
+
+This file is still a work in progress...
