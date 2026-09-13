@@ -1,0 +1,74 @@
+#include <cuda_runtime.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#define N 10000000  // 10 million elements
+#define BLOCK_SIZE 256
+
+// CUDA kernel: compute the partial sum for each block
+__global__ void reduce_kernel(const float* __restrict__ d_in, float* __restrict__ d_out, int n) {
+    // 1. Allocate dynamic shared memory
+    extern __shared__ float sdata[];
+    
+    unsigned int tid = threadIdx.x;
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // 2. Load data from global memory to shared memory (with boundary check)
+    sdata[tid] = (i < n) ? d_in[i] : 0.0f;
+    __syncthreads(); // Must synchronize to ensure all threads have finished loading
+
+    // 3. Perform tree reduction in shared memory
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads(); // Must synchronize each iteration to prevent reading/writing unupdated data
+    }
+
+    // 4. Write the result of each block back to global memory
+    if (tid == 0) {
+        d_out[blockIdx.x] = sdata[0];
+    }
+}
+
+int main() {
+    // 1. Prepare Host data
+    float* h_in = (float*)malloc(N * sizeof(float));
+    float* h_out = (float*)malloc(N * sizeof(float));
+    float cpu_sum = 0.0f;
+    for (int i = 0; i < N; i++) {
+        h_in[i] = 1.0f; // Set all to 1 for easy verification; result should be 10000000
+        cpu_sum += h_in[i];
+    }
+
+    // 2. Prepare Device data
+    float *d_in, *d_out;
+    cudaMalloc((void**)&d_in, N * sizeof(float));
+    int gridSize = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    cudaMalloc((void**)&d_out, gridSize * sizeof(float));
+
+    cudaMemcpy(d_in, h_in, N * sizeof(float), cudaMemcpyHostToDevice);
+
+    // 3. Launch kernel
+    // Dynamic shared memory size = BLOCK_SIZE * sizeof(float)
+    reduce_kernel<<<gridSize, BLOCK_SIZE, BLOCK_SIZE * sizeof(float)>>>(d_in, d_out, N);
+    cudaDeviceSynchronize();
+
+    // 4. Final step: Sum up the results of each block (done on CPU, or write another kernel)
+    cudaMemcpy(h_out, d_out, gridSize * sizeof(float), cudaMemcpyDeviceToHost);
+    float gpu_sum = 0.0f;
+    for (int i = 0; i < gridSize; i++) {
+        gpu_sum += h_out[i];
+    }
+
+    // 5. Verify result
+    printf("CPU Sum: %.2f\n", cpu_sum);
+    printf("GPU Sum: %.2f\n", gpu_sum);
+    printf("Result: %s\n", (abs(cpu_sum - gpu_sum) < 1e-3) ? "PASS" : "FAIL");
+
+    // 6. Free memory
+    free(h_in); free(h_out);
+    cudaFree(d_in); cudaFree(d_out);
+
+    return 0;
+}
