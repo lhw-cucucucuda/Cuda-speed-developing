@@ -1,0 +1,191 @@
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <iostream>
+#include <chrono>
+#include <cmath>
+
+#define N 10000000              // 10 million elements
+#define BLOCK_SIZE 256
+#define REPEAT 100              // Repeat 100 times to avoid overhead contamination in timing
+
+// ==================== Kernel 1: Shared Memory Tree Reduction ====================
+__global__ void reduce_sum_shared_kernel(const half* __restrict__ input, float* __restrict__ d_out, int n) {
+    // Allocate dynamic shared memory
+    extern __shared__ float sdata[];
+    
+    unsigned int tid = threadIdx.x;
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Load data from global memory to shared memory (with boundary check)
+    sdata[tid] = (i < n) ? __half2float(input[i]) : 0.0f;
+    __syncthreads(); // Must synchronize to ensure all threads have loaded their data
+
+    // Tree reduction in shared memory
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads(); // Must synchronize each iteration to avoid reading unupdated data
+    }
+
+    // Write the result of this block back to global memory
+    if (tid == 0) {
+        d_out[blockIdx.x] = sdata[0];
+    }
+}
+
+// ==================== Kernel 2: Warp Shuffle Register Reduction ====================
+__global__ void reduce_sum_shfl_kernel(const half* __restrict__ input, float* __restrict__ d_out, int n) {
+    // Shared memory for storing the sum of each warp
+    __shared__ float warp_sums[BLOCK_SIZE / 32];
+
+    unsigned int tid = threadIdx.x;
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Load data directly into a register variable (with boundary check)
+    float val = (i < n) ? __half2float(input[i]) : 0.0f;
+
+    // Layer 1: Warp-level reduction using shuffle
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+
+    // Each warp's thread 0 writes its result to shared memory
+    if (tid % 32 == 0) {
+        warp_sums[tid / 32] = val;
+    }
+    __syncthreads();
+
+    // Layer 2: First warp aggregates all warp sums
+    if (tid < 32) {
+        float final_val = (tid < blockDim.x / 32) ? warp_sums[tid] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            final_val += __shfl_down_sync(0xffffffff, final_val, offset);
+        }
+        if (tid == 0) {
+            d_out[blockIdx.x] = final_val;
+        }
+    }
+}
+
+int main() {
+    // ==================== 1. Prepare Host Data ====================
+    auto t_prep_start = std::chrono::high_resolution_clock::now();
+
+    half* h_input = (half*)malloc(N * sizeof(half));
+    double h_result = 0.0;
+    for (int i = 0; i < N; i++) {
+        h_input[i] = __float2half(1.0f);   // Set all to 1 for easy verification: result should be 10000000
+        h_result += __half2float(h_input[i]);
+    }
+
+    auto t_prep_end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> time_prep = t_prep_end - t_prep_start;
+
+    // ==================== 2. Allocate Device Memory ====================
+    half* d_input;
+    cudaMalloc(&d_input, N * sizeof(half));
+
+    // Calculate grid size to cover all elements (since Grid-Stride Loop is removed)
+    int gridSize = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    
+    float *d_out_shared, *d_out_shfl;
+    cudaMalloc(&d_out_shared, gridSize * sizeof(float));
+    cudaMalloc(&d_out_shfl, gridSize * sizeof(float));
+
+    // ==================== 3. Host to Device Copy ====================
+    auto t_h2d_start = std::chrono::high_resolution_clock::now();
+    cudaMemcpy(d_input, h_input, N * sizeof(half), cudaMemcpyHostToDevice);
+    auto t_h2d_end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> time_h2d = t_h2d_end - t_h2d_start;
+
+    // Event timers
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    // ==================== 4. Test Shared Memory Version ====================
+    // Warmup
+    reduce_sum_shared_kernel<<<gridSize, BLOCK_SIZE, BLOCK_SIZE * sizeof(float)>>>(d_input, d_out_shared, N);
+    cudaDeviceSynchronize();
+
+    auto t_cpu_shared_start = std::chrono::high_resolution_clock::now();
+    cudaEventRecord(start);
+    for (int k = 0; k < REPEAT; k++) {
+        reduce_sum_shared_kernel<<<gridSize, BLOCK_SIZE, BLOCK_SIZE * sizeof(float)>>>(d_input, d_out_shared, N);
+    }
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float time_gpu_shared_total = 0.0f;
+    cudaEventElapsedTime(&time_gpu_shared_total, start, stop);
+    float time_gpu_shared = time_gpu_shared_total / REPEAT;
+
+    // Copy back and verify
+    float* h_out_shared = (float*)malloc(gridSize * sizeof(float));
+    cudaMemcpy(h_out_shared, d_out_shared, gridSize * sizeof(float), cudaMemcpyDeviceToHost);
+    float gpu_result_shared = 0.0f;
+    for (int i = 0; i < gridSize; i++) gpu_result_shared += h_out_shared[i];
+
+    auto t_cpu_shared_end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> time_cpu_shared = t_cpu_shared_end - t_cpu_shared_start;
+
+    // ==================== 5. Test Warp Shuffle Version ====================
+    // Warmup
+    reduce_sum_shfl_kernel<<<gridSize, BLOCK_SIZE>>>(d_input, d_out_shfl, N);
+    cudaDeviceSynchronize();
+
+    auto t_cpu_shfl_start = std::chrono::high_resolution_clock::now();
+    cudaEventRecord(start);
+    for (int k = 0; k < REPEAT; k++) {
+        reduce_sum_shfl_kernel<<<gridSize, BLOCK_SIZE>>>(d_input, d_out_shfl, N);
+    }
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float time_gpu_shfl_total = 0.0f;
+    cudaEventElapsedTime(&time_gpu_shfl_total, start, stop);
+    float time_gpu_shfl = time_gpu_shfl_total / REPEAT;
+
+    // Copy back and verify
+    float* h_out_shfl = (float*)malloc(gridSize * sizeof(float));
+    cudaMemcpy(h_out_shfl, d_out_shfl, gridSize * sizeof(float), cudaMemcpyDeviceToHost);
+    float gpu_result_shfl = 0.0f;
+    for (int i = 0; i < gridSize; i++) gpu_result_shfl += h_out_shfl[i];
+
+    auto t_cpu_shfl_end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> time_cpu_shfl = t_cpu_shfl_end - t_cpu_shfl_start;
+
+    // ==================== 6. Output Report ====================
+    printf("========== Results (N = %d, Blocks = %d) ==========\n", N, gridSize);
+    printf("CPU Result (Double): %lf\n", h_result);
+    printf("Shared Kernel Result: %.0f (%s)\n", gpu_result_shared, (fabs(h_result - gpu_result_shared) < 1e-3) ? "PASS" : "FAIL");
+    printf("Shfl   Kernel Result: %.0f (%s)\n", gpu_result_shfl, (fabs(h_result - gpu_result_shfl) < 1e-3) ? "PASS" : "FAIL");
+
+    printf("\n========== Timing (Repeat = %d) ==========\n", REPEAT);
+    printf("CPU Data Prep Time:           %.4f ms\n", time_prep.count());
+    printf("Host to Device Copy Time:     %.4f ms\n", time_h2d.count());
+    printf("-------------------------------------------\n");
+    printf("[Shared Mem Version]\n");
+    printf("  GPU Kernel Avg Time:        %.6f ms\n", time_gpu_shared);
+    printf("  CPU End-to-End Time:        %.4f ms\n", time_cpu_shared.count());
+    printf("[Warp Shuffle Version]\n");
+    printf("  GPU Kernel Avg Time:        %.6f ms\n", time_gpu_shfl);
+    printf("  CPU End-to-End Time:        %.4f ms\n", time_cpu_shfl.count());
+
+    printf("\nSpeedup (GPU Kernel): Shared/Shfl = %.2fx\n", time_gpu_shared / time_gpu_shfl);
+    printf("Speedup (CPU E2E)  : Shared/Shfl = %.2fx\n", time_cpu_shared.count() / time_cpu_shfl.count());
+
+    // ==================== 7. Free Resources ====================
+    cudaEventDestroy(start); cudaEventDestroy(stop);
+    free(h_input); free(h_out_shared); free(h_out_shfl);
+    cudaFree(d_input); cudaFree(d_out_shared); cudaFree(d_out_shfl);
+    return 0;
+}
+## 🚀 Key Features
+
+*   **Hybrid Reduction Architecture:** Implements a two-stage reduction approach combining shared memory for block-level communication and warp shuffle primitives (`__shfl_down_sync`) for intra-warp register-level reduction.
+*   **Minimal Synchronization Overhead:** Drastically reduces `__syncthreads()` calls by leveraging `__shfl_down_sync` to exchange data directly within registers, avoiding the latency of shared memory round-trips.
+*   **Optimized Memory Access:** Employs `const __restrict__` pointers and branch-free shuffle loops to ensure coalesced global memory access and minimize warp divergence.
+*   **Numerical Precision & Stability:** Promotes `half` (FP16) to `float` (FP32) during accumulation to prevent overflow, and validates results against a CPU-side `double` (FP64) reference.
+*   **Robust Benchmarking:** Utilizes GPU warm-up phases, `cudaEvent_t` for high-resolution timing, and repeated iterations (`REPEAT=100`) to provide accurate, noise-free performance metrics (GPU Kernel vs. CPU End-to-End).
