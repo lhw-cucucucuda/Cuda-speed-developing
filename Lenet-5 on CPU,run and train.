@@ -1,0 +1,652 @@
+#include <iostream>
+#include <random>
+#include <cmath>
+#include <algorithm>
+#include<time.h>
+using namespace std;
+
+// ==================== 网络结构定义（支持反向传播）====================
+float lr = 0.005;
+// 输入图像尺寸：32x32 单通道
+float input[1][32][32];
+// ---------- 第一卷积层 ----------
+// 卷积核: 7个 5x5，输入通道1 -> 输出通道7
+// 存储格式: [输出通道][输入通道][高][宽][2] 最后一维: 0权重 1损失
+float conv1_w[7][1][5][5] = {};
+float conv1_b[7] = {};          // 偏置: [通道][2] 0偏置值 1损失
+bool relupos1[7][28][28] = {1};//0为神经元强制死亡，1为正常反向传播
+// 卷积输出: 28x28 (32-5+1)
+float conv1_out[7][28][28] = {};
+
+// 池化层1: 2x2 最大池化, 步长2 -> 14x14
+// 记录最大值位置 (0~3 对应 2x2 窗口内的索引)
+short pool1_pos[7][14][14] = {};
+float pool1_out[7][14][14][2] = {};
+
+
+// ---------- 第二卷积层 ----------
+// 卷积核: 10个 5x5，输入通道7 -> 输出通道10
+float conv2_w[10][7][5][5] = {};
+float conv2_b[10] = {};
+bool relupos2[10][10][10];
+// 卷积输出: 10x10 (14-5+1)
+float conv2_out[10][10][10] = {};
+
+// 池化层2: 2x2 最大池化, 步长2 -> 5x5
+short pool2_pos[10][5][5] = {};
+float pool2_out[10][5][5][2] = {};
+
+
+// ---------- 第三卷积层 ----------
+// 卷积核: 20个 5x5，输入通道10 -> 输出通道20
+float conv3_w[20][10][5][5] = {};
+float conv3_b[20] = {};
+bool relupos3[20][1][1];
+// 卷积输出: 1x1 (5-5+1) 因为输入5x5，卷积核5x5，步长1无填充 -> 1x1
+float conv3_out[20][1][1][2] = {};   // 实际只需20个值，但保留维度便于统一处理
+
+// 展平: 20 维向量
+float flatten[20][2] = {};
+
+
+// ---------- 全连接层1 ----------
+// 权重: 输入20, 输出30
+float fc1_w[30][20] = {};      // [输出][输入][2]
+float fc1_b[30] = {};
+bool relupos4[30] = {1};
+float fc1_out[30][2] = {};
+
+
+// ---------- 输出层 (全连接2) ----------
+// 权重: 输入30, 输出3
+float fc2_w[3][30] = {};        // [输出][输入][2]
+float fc2_b[3] = {};
+bool relupos5[3];
+float output[3][2] = {};
+
+float goal[3] = {1, 0, 0};
+float acc[3];
+
+// ==================== 数字 1 ====================
+const char* digit1[32] = {
+    "................................",
+    "................................",
+    "................................",
+    "................................",
+    "................................",
+    "................................",
+    "..................###...........",
+    ".................####...........",
+    "................#####...........",
+    "...............######...........",
+    "..............#######...........",
+    ".............########...........",
+    ".............######.............",
+    "..............#####.............",
+    "...............####.............",
+    "................###.............",
+    "................###.............",
+    "................###.............",
+    "................###.............",
+    "................###.............",
+    "................###.............",
+    "................###.............",
+    "................###.............",
+    "...............#####............",
+    "..............#######...........",
+    "..............#######...........",
+    "................................",
+    "................................",
+    "................................",
+    "................................",
+    "................................",
+    "................................"
+};
+
+// ==================== 数字 2 ====================
+const char* digit2[32] = {
+    "................................",
+    "................................",
+    "................................",
+    "................................",
+    "................................",
+    "..............#####.............",
+    "............#########...........",
+    "...........###########..........",
+    "..........####.....####.........",
+    "..........###.......###.........",
+    "..........##.........##.........",
+    ".....................##.........",
+    "....................###.........",
+    "...................###..........",
+    "..................###...........",
+    ".................###............",
+    "................###.............",
+    "...............###..............",
+    "..............###...............",
+    ".............###................",
+    "............####................",
+    "...........####.................",
+    "..........####..................",
+    "..........###...................",
+    "..........###...................",
+    "..........################......",
+    "..........################......",
+    "..........################......",
+    "................................",
+    "................................",
+    "................................",
+    "................................"
+};
+
+// ==================== 数字 3 ====================
+const char* digit3[32] = {
+    "................................",
+    "................................",
+    "................................",
+    "................................",
+    "................................",
+    "..............#####.............",
+    "............#########...........",
+    "...........###########..........",
+    "..........####.....####.........",
+    "..........###.......###.........",
+    "..........##.........##.........",
+    ".....................##.........",
+    "....................###.........",
+    "...................###..........",
+    "..................###...........",
+    ".................####...........",
+    "................######..........",
+    ".................#####..........",
+    "..................####..........",
+    "...................###..........",
+    "....................##..........",
+    "....................##..........",
+    "...................###..........",
+    "..........##......###...........",
+    "..........###....####...........",
+    "...........########.............",
+    "............######..............",
+    ".............####...............",
+    "................................",
+    "................................",
+    "................................",
+    "................................"
+};//训练集
+void load_pattern(float img[1][32][32], const char* pattern[32]){
+    for(int i = 0; i < 32; i++){
+        for(int j = 0; j < 32; j++){
+            img[0][i][j] = (pattern[i][j] == '#') ? 1.0f : 0.0f;
+        }
+    }
+}
+/*==================== ReLU 激活函数 ====================
+float relu(float x) {
+    return max(0.0f, x);
+}*/
+void initarr(){
+    for(int i = 0; i < 7; i++){
+        for(int j = 0; j < 1; j++){
+            for(int k = 0; k < 5; k++){
+                for(int l = 0; l < 5; l++){
+                    conv1_w[i][j][k][l] = ((float)rand() / RAND_MAX - 0.5) * 0.2;
+     }conv1_b[i] = ((float)rand() / RAND_MAX - 0.5) * 0.2;}}}
+    for(int i = 0; i < 10; i++){
+        for(int j = 0; j < 7; j++){
+            for(int k = 0; k < 5; k++){
+                for(int l = 0; l < 5; l++){
+                    conv2_w[i][j][k][l] = ((float)rand() / RAND_MAX - 0.5) * 0.2;
+     }conv2_b[i] = ((float)rand() / RAND_MAX - 0.5) * 0.2;}}}
+    for(int i = 0; i < 20; i++){
+        for(int j = 0; j < 10; j++){
+            for(int k = 0; k < 5; k++){
+                for(int l = 0; l < 5; l++){
+                    conv3_w[i][j][k][l] = ((float)rand() / RAND_MAX - 0.5) * 0.2;
+     }conv3_b[i] = ((float)rand() / RAND_MAX - 0.5) * 0.2;}}}     
+    
+    for(int i = 0; i < 30; i++){
+        for(int j = 0; j < 20; j++){
+            fc1_w[i][j] = ((float)rand() / RAND_MAX - 0.5) * 0.2;
+    }fc1_b[i] = ((float)rand() / RAND_MAX - 0.5) * 0.2;}
+    for(int i = 0; i < 3; i++){
+        for(int j = 0; j < 30; j++){
+            fc2_w[i][j] = ((float)rand() / RAND_MAX - 0.5) * 0.2;
+    }fc2_b[i] = ((float)rand() / RAND_MAX - 0.5) * 0.2;}
+}    
+void conv1(){
+    float sum = 0;
+    for(int a = 0; a < 7; a++){
+        for(int b = 0; b < 1; b++){
+            for(int c = 0; c < 28; c++){
+                for(int d = 0; d < 28; d++){
+                    relupos1[a][c][d] = 1;
+                    sum = conv1_b[a];
+                    for(int e = 0; e < 5; e++){
+                        for(int f = 0; f < 5; f++){
+                            sum += conv1_w[a][b][e][f] * input[b][c+e][d+f];
+                    }}
+                    conv1_out[a][c][d] = sum;
+                    if(conv1_out[a][c][d] < 0) {conv1_out[a][c][d] = 0; relupos1[a][c][d] = 0;}//relu
+    }}}}
+}
+/*void relu1(){
+    for(int i = 0; i < 7; i++){
+        for(int j = 0; j < 28; j++){
+            for(int k = 0; k < 28; k++){
+                relupos1[i][j][k] = 1; 
+    }}}for(int i = 0; i < 7; i++){
+        for(int j = 0; j < 28; j++){
+            for(int k = 0; k < 28; k++){
+                if(conv1_out[i][j][k] < 0) {conv1_out[i][j][k] = 0; relupos1[i][j][k] = 0;}
+            }
+        }
+    }
+}    */
+void pool1(){
+    float lz = 0.0f;
+    short pos = 0;
+    for(int i = 0; i < 7; i++){
+        for(int j = 0; j < 14; j++){
+            for(int k = 0; k < 14; k++){
+                for(int m = 0; m < 2; m++){
+                    for(int n = 0; n < 2; n++){
+                        if(lz < conv1_out[i][2*j+m][2*k+n]){
+                            lz = conv1_out[i][2*j+m][2*k+n];
+                            pos = m*2 + n;
+                }}}pool1_pos[i][j][k] = pos;
+                pool1_out[i][j][k][0] = lz;
+                lz = 0.0f; pos = 0;
+    }}}                        
+}
+void conv2(){
+    float sum = 0;
+    for(int a = 0; a < 10; a++){
+        for(int c = 0; c < 10; c++){
+            for(int d = 0; d < 10; d++){
+                relupos2[a][c][d] = 1;
+                sum = conv2_b[a];
+                for(int b = 0; b < 7; b++){
+                    for(int e = 0; e < 5; e++){
+                        for(int f = 0; f < 5; f++){
+                            sum += conv2_w[a][b][e][f] * pool1_out[b][c+e][d+f][0];
+                }}}
+                conv2_out[a][c][d] = sum;
+                if(conv2_out[a][c][d] < 0) {conv2_out[a][c][d] = 0; relupos2[a][c][d] = 0;}//relu
+    }}}
+}
+void pool2(){
+    float lz = 0.0f;
+    short pos = 0;
+    for(int i = 0; i < 10; i++){
+        for(int j = 0; j < 5; j++){
+            for(int k = 0; k < 5; k++){
+                for(int m = 0; m < 2; m++){
+                    for(int n = 0; n < 2; n++){
+                        if(lz < conv2_out[i][2*j+m][2*k+n]){
+                            lz = conv2_out[i][2*j+m][2*k+n];
+                            pos = m*2 + n;
+                }}}pool2_pos[i][j][k] = pos;
+                pool2_out[i][j][k][0] = lz;
+                lz = 0.0f; pos = 0;
+    }}}                        
+}
+void conv3(){
+    float sum = 0;
+    for(int a = 0; a < 20; a++){
+        for(int c = 0; c < 1; c++){
+            for(int d = 0; d < 1; d++){
+                relupos3[a][c][d] = 1;
+                sum = conv3_b[a];
+                for(int b = 0; b < 10; b++){
+                    for(int e = 0; e < 5; e++){
+                        for(int f = 0; f < 5; f++){
+                            sum += conv3_w[a][b][e][f] * pool2_out[b][c+e][d+f][0];
+                }}}
+                conv3_out[a][c][d][0] = sum;
+                if(conv3_out[a][c][d][0] < 0) {conv3_out[a][c][d][0] = 0; relupos3[a][c][d] = 0;}//relu
+    }}}
+}
+void flt(){
+    for(int i = 0; i < 20; i++){
+        flatten[i][0] = conv3_out[i][0][0][0];
+    }
+}        
+void mlp1(){
+    float sum = 0.0f;
+    for(int i = 0; i < 30; i++){
+        relupos4[i] = 1;//init
+        sum = fc1_b[i];
+        for(int j = 0; j < 20; j++){
+             sum += fc1_w[i][j] * flatten[j][0];
+        }if(sum < 0){sum = 0; relupos4[i] = 0;}
+        fc1_out[i][0] = sum;
+    }         
+}
+void mlp2(){
+    for(int i = 0; i < 3; i++){
+        relupos5[i] = 1;   // 永远为 1，没有截断
+        float sum = fc2_b[i];
+        for(int j = 0; j < 30; j++){
+            sum += fc2_w[i][j] * fc1_out[j][0];
+        }
+        output[i][0] = sum;
+    }
+}
+float losscalc(float output, float standard){
+    return output - standard;
+}  
+void backward1(){
+    short pos1 = 0;
+    short pos2 = 0;
+    float loss = 0.0f;
+    for(int i = 0; i < 7; i++){
+        for(int j = 0; j < 1; j++){
+            for(int k = 0; k < 14; k++){
+                for(int l = 0; l < 14; l++){
+                    pos1 = pool1_pos[i][k][l] /2;
+                    pos2 = pool1_pos[i][k][l] %2;
+                    loss = pool1_out[i][k][l][1];
+                    for(int c = 0; c < 5; c++){
+                        for(int d = 0; d < 5; d++){
+                            //conv1_out[i][2*k+pos1][2*l+pos2] += conv1_w[i][j][c][d]*input[j][2*k+pos1+c][2*l+pos2+d]
+                            if(relupos1[i][2*k+pos1][2*l+pos2] == 1) conv1_w[i][j][c][d] -= loss * input[j][2*k+pos1+c][2*l+pos2+d] * lr;
+                            //input[j][2*k+pos1+c][2*l+pos2+d][1] += loss * conv1_w[i][j][c][d] * relupos1[i][2*k+pos1][2*l+pos2];
+                    }}
+                   if(relupos1[i][2*k+pos1][2*l+pos2] == 1) conv1_b[i] -= loss * lr;
+    }}}}
+}   
+void backward2(){
+    short pos1 = 0;
+    short pos2 = 0;
+    float loss = 0.0f;
+    for(int m = 0; m < 7; m++){
+        for(int a = 0; a < 14; a++){
+            for(int b = 0; b < 14; b++){
+                pool1_out[m][a][b][1] = 0;
+    }}}
+    for(int i = 0; i < 10; i++){
+        for(int j = 0; j < 7; j++){
+            for(int k = 0; k < 5; k++){
+                for(int l = 0; l < 5; l++){
+                    pos1 = pool2_pos[i][k][l] /2;
+                    pos2 = pool2_pos[i][k][l] %2;
+                    loss = pool2_out[i][k][l][1];
+                    for(int c = 0; c < 5; c++){
+                        for(int d = 0; d < 5; d++){
+                            //conv1_out[i][2*k+pos1][2*l+pos2] += conv1_w[i][j][c][d]*input[j][2*k+pos1+c][2*l+pos2+d]
+                            pool1_out[j][2*k+pos1+c][2*l+pos2+d][1] += loss * conv2_w[i][j][c][d] * relupos2[i][2*k+pos1][2*l+pos2];
+                            conv2_w[i][j][c][d] -= loss * pool1_out[j][2*k+pos1+c][2*l+pos2+d][0] * lr * relupos2[i][2*k+pos1][2*l+pos2];
+                    }}
+                   conv2_b[i] -= loss * lr * relupos2[i][2*k+pos1][2*l+pos2];
+    }}}}
+} 
+void backward3(){
+    short pos1 = 0;
+    short pos2 = 0;
+    float loss = 0.0f;
+    for(int m = 0; m < 10; m++){
+        for(int a = 0; a < 5; a++){
+            for(int b = 0; b < 5; b++){
+                pool2_out[m][a][b][1] = 0;
+    }}}
+    for(int i = 0; i < 20; i++){
+        for(int j = 0; j < 10; j++){
+            for(int k = 0; k < 1; k++){
+                for(int l = 0; l < 1; l++){
+                    pos1 = 0;
+                    pos2 = 0;
+                    loss = conv3_out[i][k][l][1];
+                    for(int c = 0; c < 5; c++){
+                        for(int d = 0; d < 5; d++){
+                            //conv1_out[i][2*k+pos1][2*l+pos2] += conv1_w[i][j][c][d]*input[j][2*k+pos1+c][2*l+pos2+d]
+                            pool2_out[j][2*k+pos1+c][2*l+pos2+d][1] += loss * conv3_w[i][j][c][d] * relupos3[i][2*k+pos1][2*l+pos2];
+                            conv3_w[i][j][c][d] -= loss * pool2_out[j][2*k+pos1+c][2*l+pos2+d][0] * lr * relupos3[i][2*k+pos1][2*l+pos2];
+                    }}
+                   conv3_b[i] -= loss * lr * relupos3[i][2*k+pos1][2*l+pos2];
+    }}}}
+}
+void fltbackward(){
+    for(int i = 0; i < 20; i++){
+        conv3_out[i][0][0][1] = flatten[i][1];
+    }
+}        
+void mlpbackward1(){
+    float loss = 0.0f;
+    for(int a = 0; a < 20; a++){
+        flatten[a][1] = 0;
+    } 
+    for(int i = 0; i < 30; i++){
+        loss = fc1_out[i][1];
+        for(int j = 0; j < 20; j++){
+            flatten[j][1] += loss * fc1_w[i][j] * relupos4[i];
+            fc1_w[i][j] -= loss * flatten[j][0] * lr * relupos4[i];
+        }fc1_b[i] -= loss * lr * relupos4[i];
+    }
+}
+void mlpbackward2(){
+    float loss = 0.0f;
+    for(int a = 0; a < 30; a++){
+        fc1_out[a][1] = 0;
+    }    
+    for(int i = 0; i < 3; i++){
+        loss = output[i][1];
+        for(int j = 0; j < 30; j++){
+            fc1_out[j][1] += loss * fc2_w[i][j] * relupos5[i];
+            fc2_w[i][j] -= loss * fc1_out[j][0] * lr * relupos5[i];
+        }fc2_b[i] -= loss * lr * relupos5[i];
+    }
+}            
+void scheduler(){
+    for(int i = 0; i < 3; i++){
+        output[i][1] = losscalc(output[i][0], goal[i]) ;
+    }
+}        
+void losscompute(){
+    for(int i = 0; i < 3; i++){
+        acc[i] = losscalc(output[i][0], goal[i])* losscalc(output[i][0], goal[i]);
+    }
+}
+
+/* ==================== 损失监控（交叉熵值） ====================
+void losscompute(){
+    int target_idx = 0;
+    for(int i = 0; i < 3; i++){
+        if(goal[i] == 1.0f) { target_idx = i; break; }
+    }
+    // 交叉熵 = -log(正确类别的预测概率)
+    acc[target_idx] = -logf(acc[target_idx] + 1e-7f);
+}*/
+float out[3];
+void softmax(int length){
+    float sum = 0.0f;
+    for(int i = 0; i < length; i++){
+        sum+= output[i][0];
+    }
+    float m = 1/sum;
+    for (int j = 0; j < length; j++){
+        out[j] = output[j][0] *m ;
+    }               
+}    
+// ==================== 后续可添加前向/反向函数 ===================
+int main(){
+    float input1[1][32][32];
+    float input2[1][32][32];
+    float input3[1][32][32];
+    float test1[1][8][8] = {{
+    {0,0,0,1,1,1,0,0},
+    {0,0,1,1,1,1,0,0},
+    {0,0,0,1,1,0,0,0},
+    {0,0,0,1,1,1,0,0},
+    {0,0,0,1,1,0,0,0},
+    {0,0,0,0,1,0,0,0},
+    {0,0,0,1,1,0,0,0},
+    {0,1,1,1,1,1,0,0},
+    }};// 这是数字“1”的测试集
+    float test[1][32][32];
+    for(int i = 0; i < 8; i++){
+        for(int j = 0; j < 4; j++){
+            for(int k = 0 ; k < 8; k++){
+                for(int l = 0; l < 4; l++){
+                    test[0][4*i+j][4*k+l] = test1[0][i][k];
+    }}}}                
+    load_pattern(input1, digit1);   // 把数字1的图案写进 input1
+    load_pattern(input2, digit2);
+    load_pattern(input3, digit3);
+    
+    // 想看图案对不对，就调用 print_img：
+    // print_img(input1);
+    srand((unsigned)time(NULL));
+    clock_t start = clock();
+    int epochs = 1000;
+    initarr();
+    
+    //init input
+    /*for(int i = 0; i < 32; i++){
+        for(int j = 0; j < 32; j++){
+            input[0][i][j] = (float)rand() / RAND_MAX;
+    }}*/
+    
+    /*for(int i = 0; i < 7; i++){
+        for(int j = 0; j < 14; j++){
+            for(int k = 0; k < 14; k++){
+                pool1_out[i][j][k][1] = 0.1f;  // 假装上一层传回来 0.1
+    }}}*/
+    for(int m = 1; m <= epochs; m++){
+        goal[0] = 1; goal[1] = 0; goal[2] = 0;
+        // 然后用 input1 跑前向
+        for(int i = 0; i < 32; i++){
+            for(int j = 0; j < 32; j++){
+                input[0][i][j] = input1[0][i][j];
+        }}
+        conv1();
+        pool1();
+        conv2();
+        pool2();
+        conv3();
+        flt();
+        mlp1();
+        mlp2();
+        scheduler();
+        losscompute();
+        cout<<"epochs: "<<m<<"; loss: "<<(acc[0]+acc[1]+acc[2])/3<<endl;
+        cout << "数字1的output: " 
+         << output[0][0] << ", "
+         << output[1][0] << ", "
+         << output[2][0] << endl;
+        mlpbackward2();
+        mlpbackward1();
+        fltbackward();
+        backward3();
+        backward2();
+        backward1();
+        goal[0] = 0; goal[1] = 1; goal[2] = 0;
+               // 然后用 input2 跑前向
+        for(int i = 0; i < 32; i++){
+            for(int j = 0; j < 32; j++){
+                input[0][i][j] = input2[0][i][j];
+        }}
+        conv1();
+        pool1();
+        conv2();
+        pool2();
+        conv3();
+        flt();
+        mlp1();
+        mlp2();
+        scheduler();
+        losscompute();
+        cout<<"epochs: "<<m<<"; loss: "<<(acc[0]+acc[1]+acc[2])/3<<endl;
+        cout << "数字2的output: " 
+         << output[0][0] << ", "
+         << output[1][0] << ", "
+         << output[2][0] << endl;
+        mlpbackward2();
+        mlpbackward1();
+        fltbackward();
+        backward3();
+        backward2();
+        backward1();
+        goal[0] = 0; goal[1] = 0; goal[2] = 1;
+               // 然后用 input3 跑前向
+        for(int i = 0; i < 32; i++){
+            for(int j = 0; j < 32; j++){
+                input[0][i][j] = input3[0][i][j];
+        }}
+        conv1();
+        pool1();
+        conv2();
+        pool2();
+        conv3();
+        flt();
+        mlp1();
+        mlp2();
+        scheduler();
+        losscompute();
+        cout<<"epochs: "<<m<<"; loss: "<<(acc[0]+acc[1]+acc[2])/3<<endl;
+        cout << "数字3的output: " 
+         << output[0][0] << ", "
+         << output[1][0] << ", "
+         << output[2][0] << endl;
+        mlpbackward2();
+        mlpbackward1();
+        fltbackward();
+        backward3();
+        backward1();
+        cout << "process: " << (float(m) / float(epochs))*100 << "%"<<endl;
+        lr = ((acc[0]+acc[1]+acc[2])/3)/10;
+        if(lr < 1e-5f) lr = 1e-5f;   // ★ 加个下界，防止学习率太小训练停滞
+        //if(((acc[0]+acc[1]+acc[2])/3) <= 0.0001) break;//如果后续加了验证集，可用于早停
+    }    
+    //test
+    for(int i = 0; i < 32; i++){
+        for(int j = 0; j < 32; j++){
+            input[0][i][j] = test[0][i][j];
+    }}
+    conv1();
+    pool1();
+    conv2();
+    pool2();
+    conv3();
+    flt();
+    mlp1();
+    mlp2();
+    scheduler();
+    losscompute();
+    softmax(3);
+    cout <<endl<< "测试集的output(softmax): " 
+     << out[0]*100 << "% , "
+     << out[1]*100 << "% , "
+     << out[2]*100 << "%"<<endl
+     <<"origin:"
+     << output[0][0]<<", "
+     << output[1][0]<<", "
+     << output[2][0]<<endl;
+     
+   /* for(int i = 0; i < 7; i++){
+        for(int j = 0; j < 28; j++){
+            for(int k = 0; k < 28; k++){
+                cout<<conv1_out[i][j][k]<<"      ";
+            }cout <<endl;
+        }cout<<endl;
+    }cout<<endl<<endl<<endl<<endl<<endl<<endl<<endl<<endl<<endl;*/
+    /*for(int i = 0; i < 7; i++){
+        for(int j = 0; j < 28; j++){
+            for(int k = 0; k < 28; k++){
+                cout<<conv1_out[i][j][k]<<"      ";
+            }cout <<endl;
+        }cout<<endl;
+    }*/ /*cout<<conv1_out; 
+    cout<<endl<<endl<<endl<<endl<<endl<<endl<<endl<<endl<<endl;
+    for(int i = 0; i < 7; i++){
+        for(int j = 0; j < 14; j++){
+            for(int k = 0; k < 14; k++){
+                cout<<pool1_out[i][j][k][0]<<"      ";
+            }cout<<endl;
+        }cout<<endl;
+    } */
+    clock_t end = clock(); 
+    float time = (float)(end-start)/CLOCKS_PER_SEC;
+    cout<<endl<<start<<" "<<end<<endl<<time;
+    return 0;
+}    
