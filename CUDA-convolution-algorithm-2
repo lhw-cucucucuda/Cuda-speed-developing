@@ -1,0 +1,256 @@
+//cuda assembly convolution code
+//a kind of algorithm created by myself, I promise It is my original creation, not others.
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <iostream>
+#include <stdlib.h>
+
+__device__ int groupdatasize_ = 100;
+__device__ int allblocktask = 1;
+
+
+//real input length
+//#define Len2 26
+//shared length
+//#define Len1 52
+
+#define BSIZE 20
+#define SSIZE 20
+#define OUTSIZE 28
+#define KSIZE 5
+
+extern "C" __global__ void lenetforward(int bsize, int ssize, int outsize, int ksize, float* __restrict__ input, float* __restrict__ output, float* __restrict__ kernel, float* __restrict__ bias) {
+	//int warp_id = threadIdx.x / 32;
+	//int lane_id = threadIdx.x % 32;
+	//规约的线程有26个
+
+	//int pointpos1, pointpos2, pointpos3;
+
+	bool assembly_line = false;
+	bool inputer = false;
+	bool outputer = false;
+
+	extern __shared__ float smem[];
+	__shared__ float divide0;
+	int tid = threadIdx.x;
+	if (tid == 0) divide0 = 0.0f;
+	__syncthreads();
+	int usedtid = 0;//如果tid < usedtid，这个tid被占用了   tid >= usedtid就是还闲着
+	int usedmem = 0;//如果mem < usedmem，这个mem被占用了   mem >= usedmem就是还没分配
+	int deepth = 0;
+	float* input1 = &divide0;
+	float* input2 = &divide0;
+	float* output1 = &divide0;
+	float sum1;
+	int N = ssize * ksize * ksize;
+	for (int i = ssize * ksize * ksize, j = (ssize * ksize * ksize + 1) >> 1; j > 1; i += 1, i >>= 1, j += 1, j >>= 1) {
+	//for (int i = N, j = (N + 1) >> 1; j > 1; i = j, j = (j + 1) >> 1){
+		if (tid >= usedtid && tid < usedtid + j){
+			int k = tid - usedtid;
+			input1 = smem + usedmem + k;
+			//pointpos1 = usedmem + k;
+			input2 = k + j < i ? smem + usedmem + k + j : &divide0;
+			//pointpos2 = k + j < i ? usedmem + k + j : -1;
+			output1 = smem + usedmem + i + k;
+			//pointpos3 = usedmem + i + k;
+			assembly_line = true;
+		}
+		usedmem += i;
+		usedtid += j;
+		deepth += 1;
+	}
+	//output pos
+	//printf("thread %d, input1: %d, input2: %d, output1: %d\n", tid, pointpos1, pointpos2, pointpos3);
+	//然后开始计算
+	int outx = 0, outy = 0, b = 0;
+	int workid = 0;
+	int sworkid, k1workid, k2workid;
+	//if (tid == 0) printf("usedtid: %d   %d\n", usedtid, ((usedtid + 31) / 32) * 32);
+	//((usedtid + 31) / 32) * 32  ===>>>  (usedtid + 31) & ~31;
+	if (tid >= ((usedtid + 31) / 32) * 32 && tid < ((usedtid + 31) / 32) * 32 + ssize * ksize * ksize) {
+		workid += tid - (((usedtid + 31) / 32) * 32);
+		sworkid = workid / (ksize * ksize);
+		k1workid = (workid - sworkid * (ksize * ksize)) / ksize;
+		k2workid = workid - (sworkid * ksize + k1workid) * ksize;
+		output1 = smem + tid - ((usedtid + 31) / 32) * 32;
+		//printf("tid: %d\n", tid);
+		//printf("tid %d, workid %d, output1 %d\n", tid, workid, tid - ((usedtid + 31) / 32) * 32);
+		inputer = true;
+	}
+	if (tid == ((usedtid + 31) / 32) * 32 + ssize * ksize * ksize) {
+		//input1 = smem + usedmem - 2; 
+		//input2 = smem + usedmem - 1;
+		//printf("tid %d, input1 %d, input2 %d\n", tid, usedmem - 2, usedmem - 1);
+		input1 = smem + usedtid + ssize * ksize * ksize - 1;
+		input2 = smem + usedtid + ssize * ksize * ksize - 2;
+		//printf("%d, %d\n", usedtid + ssize * ksize * ksize - 1, usedtid + ssize * ksize * ksize - 2);
+		outputer = true;
+	}
+	for (int i = blockIdx.x, j = 0; i < ((bsize * outsize * outsize + gridDim.x - 1) / gridDim.x + deepth + 1) * gridDim.x; i += gridDim.x, j++) {
+		b = i / (outsize * outsize);
+		outx = (i - outsize * outsize * b) / outsize;
+		outy = i - (((b * outsize) + outx) * outsize);
+		outputer == true ? (j - deepth > 0 ? sum1 = *input1 + *input2 : workid += 0) : workid += 0;
+		assembly_line == true ? sum1 = *input1 + *input2 : workid = 0;
+		inputer == true ? (sum1 = i < bsize * outsize * outsize ? input[(sworkid * (outsize + ksize) + outx + k1workid) * (outsize + ksize) + outy + k2workid] * kernel[((b * ssize + sworkid) * ksize + k1workid) * ksize + k2workid] : 0) : workid += 0;
+		__syncthreads();
+		outputer == true ? (j - deepth > 0 ? output[i - gridDim.x * (deepth + 1)] = sum1 + bias[(i - gridDim.x * (deepth + 1)) / (outsize * outsize)] : workid += 0) : workid += 0;
+		assembly_line == true ? *output1 = sum1 : workid += 0;
+		inputer == true ? (*output1 = i < bsize * outsize * outsize ? sum1 : 0) : workid += 0;
+		__syncthreads();
+		//if (i == 20) {
+		//	tid < 1001 ? printf("smem[%d]: %f\n", tid, smem[tid]) : workid += 0;
+		//}
+	}
+	//if (tid == 756) printf("%f, %f", smem[498], smem[499]);
+	//if(tid < 1001) printf("smem %d: %f\n", tid, smem[tid]);
+}
+// 常规卷积：每个线程独立算一个输出，kernel 全放 shared memory
+// grid = 24, block = 1024, shared = bsize*ssize*ksize*ksize*4B = 20KB
+extern "C" __global__ void conv2d_direct(
+	int bsize, int ssize, int outsize, int ksize,
+	float* __restrict__ input, float* __restrict__ output, float* __restrict__ kernel, float* __restrict__ bias)
+{
+	extern __shared__ float sk[];   // 5000 float = 20KB
+	int tid = threadIdx.x;
+	int K2 = ksize * ksize;        // 25
+	int KCH = ssize * K2;           // 500
+	int NKB = bsize * KCH;          // 5000
+	int inW = outsize + ksize;      // 33
+	int out2 = outsize * outsize;    // 784
+	int total = bsize * out2;         // 7840
+
+	// 1. 把整个 kernel 加载到 shared memory
+	for (int i = tid; i < NKB; i += blockDim.x) {
+		sk[i] = kernel[i];
+	}
+	__syncthreads();
+
+	// 2. 每个线程独立算一个输出，grid-stride 覆盖全部
+	for (int idx = blockIdx.x * blockDim.x + tid; idx < total;
+		idx += gridDim.x * blockDim.x) {
+		int b = idx / out2;
+		int rem = idx - b * out2;
+		int ox = rem / outsize;
+		int oy = rem - ox * outsize;
+
+		float sum = 0.0f;
+		for (int s = 0; s < ssize; s++) {
+			const float* in_s = input + s * inW * inW;
+			const float* k_s = sk + b * KCH + s * K2;
+#pragma unroll
+			for (int k1 = 0; k1 < 5; k1++) {
+#pragma unroll
+				for (int k2 = 0; k2 < 5; k2++) {
+					sum += in_s[(ox + k1) * inW + (oy + k2)]
+						* k_s[k1 * 5 + k2];
+				}
+			}
+		}
+		output[idx] = sum + bias[b];
+	}
+}
+
+int main() {//datasize ???
+	cudaEvent_t start, stop;
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+	size_t sizein = SSIZE * (KSIZE + OUTSIZE) * (KSIZE + OUTSIZE) * sizeof(float);
+	size_t sizeout = BSIZE * OUTSIZE * OUTSIZE * sizeof(float);
+	size_t sizekernel = BSIZE * SSIZE * KSIZE * KSIZE * sizeof(float);
+	size_t sizebias = BSIZE * sizeof(float);
+	float* input; float* output; float* kernel; float* bias;
+	cudaMalloc(&input, sizein);
+	cudaMalloc(&output, sizeout);
+	cudaMalloc(&kernel, sizekernel);
+	cudaMalloc(&bias, sizebias);
+	float* h_input = (float*)malloc(sizein);
+	float* h_output = (float*)malloc(sizeout); 
+	float* h_kernel = (float*)malloc(sizekernel); 
+	float* h_bias = (float*)malloc(sizebias);
+	//prepare data
+	for (int i = 0; i < SSIZE * (KSIZE + OUTSIZE) * (KSIZE + OUTSIZE); i++) {
+		h_input[i] = 1;
+	}
+	for (int i = 0; i < BSIZE * SSIZE * KSIZE * KSIZE; i++) {
+		h_kernel[i] = 1;
+	}
+	for (int i = 0; i < BSIZE; i++) {
+		h_bias[i] = 1;
+	}
+	int threads = 0;
+	//copy data to device
+	cudaMemcpy(input, h_input, sizein, cudaMemcpyHostToDevice);
+	cudaMemcpy(kernel, h_kernel, sizekernel, cudaMemcpyHostToDevice);
+	cudaMemcpy(bias, h_bias, sizebias, cudaMemcpyHostToDevice);
+	//prepare threads, 必须 SSIZE <= 20 否则线程数量会超过1024个
+	//int N = SSIZE * KSIZE * KSIZE;
+	//for (int i = N, j = (N + 1) >> 1; j > 1; i = j, j = (j + 1) >> 1) {
+	//	threads += j;
+	//}threads++;
+	for (int i = SSIZE * KSIZE * KSIZE ; i > 1; i += 1, i >>= 1) {
+		threads += i;
+	}threads += 1;
+	//threads = ((threads + 31) / 32) * 32;
+	threads = (threads + 31) & ~31;
+	printf("threads: %d\n", threads);
+	int smemlength = 0;
+	//prepare smem length
+	size_t LEN;
+	for (int i = SSIZE * KSIZE * KSIZE; i > 1; i += 1, i >>= 1) {
+		smemlength += i;
+	}LEN = sizeof(float) * (smemlength + 1);
+	printf("smem length: %d\n", smemlength + 1);
+	//lenetforward1 <<<1, 100, sizeof(float) * 100 >>> (input, output, groupdatasize_, allblocktask);
+	float total_ms = 0.0f;
+	const int total_times = 10000;
+	lenetforward << <24, threads, LEN>> > (BSIZE, SSIZE, OUTSIZE, KSIZE, input, output, kernel, bias);
+	cudaEventRecord(start);
+	for (int i = 0; i < total_times; i++) {
+		lenetforward << <24, threads, LEN >> > (BSIZE, SSIZE, OUTSIZE, KSIZE, input, output, kernel, bias);
+	}
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop); // ★ 必须等 GPU 跑完，否则读到的全是 0
+
+	cudaEventElapsedTime(&total_ms, start, stop); // 计算耗时(毫秒)
+	printf("总耗时: %.4f ms\n单次耗时: %.4f ms\n", total_ms, total_ms / total_times);
+	cudaError_t err = cudaGetLastError();
+	if (err != cudaSuccess) {
+		printf("Kernel Launch Failed: %s\n", cudaGetErrorString(err));
+	}
+	err = cudaDeviceSynchronize();
+	if (err != cudaSuccess) {
+		printf("Kernel Execution Failed: %s\n", cudaGetErrorString(err));
+		return 1;
+	}
+	
+	size_t smem_kb = BSIZE * SSIZE * KSIZE * KSIZE * sizeof(float); // 20000 B
+	conv2d_direct << <24, 1024, smem_kb >> > (BSIZE, SSIZE, OUTSIZE, KSIZE, input, output, kernel, bias);
+	total_ms = 0.0f;
+	cudaEventRecord(start);
+	for (int i = 0; i < total_times; i++) {
+		conv2d_direct << <24, 1024, smem_kb >> > (BSIZE, SSIZE, OUTSIZE, KSIZE, input, output, kernel, bias);
+	}
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop); // ★ 必须等 GPU 跑完，否则读到的全是 0
+
+	cudaEventElapsedTime(&total_ms, start, stop); // 计算耗时(毫秒)
+	printf("总耗时: %.4f ms\n单次耗时: %.4f ms\n", total_ms, total_ms / total_times);
+	err = cudaGetLastError();
+	if (err != cudaSuccess) {
+		printf("Kernel Launch Failed: %s\n", cudaGetErrorString(err));
+	}
+	err = cudaDeviceSynchronize();
+	if (err != cudaSuccess) {
+		printf("Kernel Execution Failed: %s\n", cudaGetErrorString(err));
+		return 1;
+	}
+	//copy data back to host
+	cudaMemcpy(h_output, output, sizeout, cudaMemcpyDeviceToHost);
+	//output
+	for (int i = 0; i < BSIZE * OUTSIZE * OUTSIZE, i < 1000; i++) {
+		//printf("output %d: %f\n", i, h_output[i]);
+	}
+	system("pause");
+	cudaDeviceReset();
+}
